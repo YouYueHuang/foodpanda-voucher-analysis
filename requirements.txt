@@ -1,0 +1,11 @@
+# requirements.txt
+# 執行本管線 8 支 script 所需的第三方 Python 套件
+# 安裝方式：pip install -r requirements.txt
+
+requests>=2.31.0
+pandas>=2.0.0
+
+# matplotlib 為選用套件，只有 analyze_deal_coverage.py 產生 deal_histogram.png
+# 時才需要；未安裝時該 script 會自動略過畫圖，改用下方指令安裝：
+#   pip install matplotlib
+matplotlib>=3.7.0

@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Foodpanda 多國 — 抓取各國「城市列表頁」的所有 city_id
+輸出格式：國家, 城市名, city_id 的 CSV
+
+原理（沿用 foodpanda_tw_city_counts.py 已驗證的方法）：
+  1. 開啟每個國家的 /city 入口頁，解析所有 /city/{slug} 連結
+  2. 逐一開城市頁，從 HTML 中的 "city-description-{id}" /
+     "city-internal-link-{id}" 取出 city_id
+     （這是實測 20+ 個台灣城市頁 100% 驗證過的 pattern）
+
+涵蓋國家：
+  Bangladesh (bd) / Cambodia (kh) / Laos (la) / Malaysia (my)
+  Myanmar (mm) / Pakistan (pk) / Philippines (ph)
+
+執行方式：
+  python foodpanda_multi_country_city_ids.py
+  python foodpanda_multi_country_city_ids.py --country pk       # 只跑單一國家先測
+  python foodpanda_multi_country_city_ids.py --debug            # 解析失敗時存 HTML
+"""
+
+import argparse
+import base64
+import csv
+import json
+import random
+import re
+import string
+import sys
+import time
+import requests
+
+# ─── 國家設定 ────────────────────────────────────────────────────────────────
+# name        : 顯示用中文國名
+# city_page   : 城市列表入口頁（可能帶語言前綴 /zh/city、/en/city）
+# base        : 該國站台網域根，用來組出 /city/{slug} 的完整網址
+
+COUNTRIES = [
+    {"code": "bd", "name": "Bangladesh 孟加拉", "city_page": "https://www.foodpanda.com.bd/city",
+     "base": "https://www.foodpanda.com.bd"},
+    {"code": "kh", "name": "Cambodia 柬埔寨",   "city_page": "https://www.foodpanda.com.kh/en/city",
+     "base": "https://www.foodpanda.com.kh/en"},
+    {"code": "la", "name": "Laos 寮國",         "city_page": "https://www.foodpanda.la/zh/city",
+     "base": "https://www.foodpanda.la/zh"},
+    {"code": "my", "name": "Malaysia 馬來西亞",  "city_page": "https://www.foodpanda.my/zh/city",
+     "base": "https://www.foodpanda.my/zh"},
+    {"code": "mm", "name": "Myanmar 緬甸",      "city_page": "https://www.foodpanda.com.mm/en/city",
+     "base": "https://www.foodpanda.com.mm/en"},
+    {"code": "pk", "name": "Pakistan 巴基斯坦",  "city_page": "https://www.foodpanda.pk/city",
+     "base": "https://www.foodpanda.pk"},
+    {"code": "ph", "name": "Philippines 菲律賓", "city_page": "https://www.foodpanda.ph/city",
+     "base": "https://www.foodpanda.ph"},
+]
+
+REQUEST_DELAY = 0.6
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+HTML_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
+
+
+# ─── Perseus header（部分站台的頁面請求也會檢查）────────────────────────────
+
+def _perseus_id(ts_ms=None):
+    ts = ts_ms if ts_ms is not None else int(time.time() * 1000)
+    digits = "".join(random.choices(string.digits, k=18))
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    return f"{ts}.{digits}.{suffix}"
+
+
+def make_perseus_headers():
+    now_ms = int(time.time() * 1000)
+    client_id = _perseus_id(now_ms - 86400_000)
+    dps = base64.b64encode(json.dumps({
+        "session_id": "".join(random.choices("0123456789abcdef", k=32)),
+        "perseus_id": client_id,
+        "timestamp":  now_ms,
+    }, separators=(",", ":")).encode()).decode()
+    return {
+        "perseus-client-id":  client_id,
+        "perseus-session-id": _perseus_id(now_ms),
+        "dps-session-id":     dps,
+    }
+
+
+def build_session(country: dict) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.headers.update(make_perseus_headers())
+    s.headers["Origin"]  = country["base"].split("/")[0] + "//" + country["base"].split("/")[2]
+    s.headers["Referer"] = country["base"] + "/"
+    return s
+
+
+# ─── Step 1：抓城市列表頁的連結 ───────────────────────────────────────────────
+
+def fetch_city_links(session, country: dict):
+    """回傳 [(slug, 顯示名稱), ...]，去重保序。相容 /city/xx 與 /en/city/xx 等前綴。"""
+    resp = session.get(country["city_page"], headers=HTML_HEADERS, timeout=30)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    html = resp.text
+
+    # 相容各種語言前綴：href="/city/xxx"、href="/en/city/xxx"、含完整網域
+    pattern = re.compile(
+        r'href="(?:https?://[^"/]+)?(?:/[a-z]{2})?/city/([a-z0-9\-]+)/?"[^>]*>(.*?)</a>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    seen, cities = set(), []
+    for slug, inner in pattern.findall(html):
+        name = re.sub(r"<[^>]+>", "", inner).strip()
+        if not name:
+            continue
+        if slug not in seen:
+            seen.add(slug)
+            cities.append((slug, name))
+    return cities
+
+
+# ─── Step 2：從城市頁解析 city_id ─────────────────────────────────────────────
+# 已用 25 個台灣城市頁 HTML 驗證：city_id 出現在
+#   "city-description-{id}" 與 "city-internal-link-{id}" 這兩個 key 中
+# 唯一命中才採用；並過濾掉時間戳等異常大數字（曾在 yilan 頁遇過 Unix ts 誤判）
+
+CITY_ID_PATTERNS = [
+    r'city-description-(\d+)',
+    r'city-internal-link-(\d+)',
+    r'"city_id"\s*:\s*(\d+)',
+    r'"cityId"\s*:\s*(\d+)',
+    r'city_id=(\d+)',
+]
+
+MAX_VALID_CITY_ID = 1_000_000
+
+
+def fetch_city_id(session, country: dict, slug: str, debug=False):
+    url = f"{country['base']}/city/{slug}"
+    resp = session.get(url, headers=HTML_HEADERS, timeout=30)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"           # requests 有時誤判編碼，強制指定避免中文/重音字元亂碼
+    html = resp.text
+
+    for pat in CITY_ID_PATTERNS:
+        raw_matches = [int(x) for x in re.findall(pat, html)]
+        raw_matches = [x for x in raw_matches if 0 < x < MAX_VALID_CITY_ID]
+        if not raw_matches:
+            continue
+
+        distinct = set(raw_matches)
+        if len(distinct) == 1:
+            return distinct.pop()
+
+        # 大城市頁常帶「附近熱門城市」推薦區塊，會混入其他城市的 id，
+        # 造成同頁出現多個不同 id。自身 id 通常在 canonical/breadcrumb/
+        # SEO meta/hero 等多處重複出現，而推薦區塊的其他城市 id 大多只
+        # 出現一次 → 取出現次數最多者；次數相同則取文件中第一個出現的。
+        from collections import Counter
+        counts = Counter(raw_matches)
+        best_count = max(counts.values())
+        candidates = [v for v in raw_matches if counts[v] == best_count]
+        chosen = candidates[0]   # raw_matches 保留原始出現順序，取第一個即最先出現者
+        if debug:
+            print(f"    [DEBUG] pattern {pat} 命中多個不同 id: {dict(counts)}，"
+                  f"取出現次數最多者 = {chosen}")
+        return chosen
+
+    if debug:
+        fname = f"debug_{country['code']}_{slug}.html"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"    [DEBUG] 找不到 city_id，HTML 已存 {fname}")
+    return None
+
+
+# ─── 主程式 ──────────────────────────────────────────────────────────────────
+
+def crawl_country(country: dict, debug=False):
+    print("\n" + "=" * 62)
+    print(f"  {country['name']}  —  {country['city_page']}")
+    print("=" * 62)
+
+    session = build_session(country)
+    rows = []
+
+    try:
+        cities = fetch_city_links(session, country)
+    except Exception as e:
+        print(f"  ❌ 無法抓取城市列表頁: {e}")
+        return rows
+
+    print(f"  找到 {len(cities)} 個城市連結")
+    if not cities:
+        print(f"  ⚠️  沒有解析到任何連結，該站台網頁結構可能不同，"
+              f"建議用 --debug 或提供該頁 HTML")
+        return rows
+
+    for i, (slug, name) in enumerate(cities, 1):
+        try:
+            city_id = fetch_city_id(session, country, slug, debug=debug)
+            status = city_id if city_id is not None else "❌ 找不到"
+            print(f"  ({i}/{len(cities)}) {name} ({slug}) → {status}")
+            rows.append({
+                "國家":     country["name"],
+                "城市名":   name,
+                "slug":     slug,
+                "city_id":  city_id,
+            })
+        except Exception as e:
+            print(f"  ({i}/{len(cities)}) {name} ({slug}) → ❌ 失敗: {e}")
+            rows.append({"國家": country["name"], "城市名": name,
+                        "slug": slug, "city_id": None})
+        time.sleep(REQUEST_DELAY)
+
+    return rows
+
+
+def main():
+    p = argparse.ArgumentParser(description="Foodpanda 多國 city_id 爬蟲")
+    p.add_argument("--country", default=None,
+                   help="只跑單一國家代碼（如 pk），預設跑全部 7 國")
+    p.add_argument("--debug",  action="store_true", help="解析失敗時存 HTML")
+    p.add_argument("--output", default="foodpanda_multi_country_city_ids",
+                   help="輸出檔名前綴")
+    args = p.parse_args()
+
+    targets = COUNTRIES
+    if args.country:
+        targets = [c for c in COUNTRIES if c["code"] == args.country]
+        if not targets:
+            print(f"❌ 找不到國家代碼 {args.country}")
+            sys.exit(1)
+
+    all_rows = []
+    for country in targets:
+        all_rows.extend(crawl_country(country, debug=args.debug))
+
+    ok = [r for r in all_rows if r["city_id"] is not None]
+
+    print("\n" + "=" * 62)
+    print(f"  總結：成功 {len(ok)} / {len(all_rows)} 個城市連結")
+    print("=" * 62)
+    for country in targets:
+        cn = country["name"]
+        sub = [r for r in ok if r["國家"] == cn]
+        print(f"  {cn:<20s}: {len(sub)} 個城市")
+
+    # 存 CSV（依需求格式：國家, 城市名, city id）
+    csv_path = f"{args.output}.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["國家", "城市名", "city id"])
+        for r in all_rows:
+            w.writerow([r["國家"], r["城市名"], r["city_id"] if r["city_id"] is not None else ""])
+    print(f"\n💾 已儲存 {csv_path}（含 {len(all_rows)} 列，city_id 缺漏留空）")
+
+    # 額外存完整 JSON（含 slug，方便除錯）
+    json_path = f"{args.output}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(all_rows, f, ensure_ascii=False, indent=2)
+    print(f"💾 已儲存 {json_path}（含 slug 欄位供除錯）")
+
+
+if __name__ == "__main__":
+    main()

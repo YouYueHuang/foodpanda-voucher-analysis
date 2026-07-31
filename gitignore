@@ -1,0 +1,28 @@
+# ── 執行程式時產生的資料（不進版控）──────────────────────────────
+# 所有 CSV / JSON 輸出（各 Stage 的產出檔，如 vendor_count、city_id 清單等）
+*.csv
+*.json
+
+# 各 Stage 產生的資料夾
+vendor/
+menu/
+analysis/
+voucher_analysis/
+
+# --debug 模式產生的除錯檔案
+debug_*.html
+debug_menu/
+debug_page0_*.json
+
+# ── Python 環境相關 ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ── 作業系統雜項檔 ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+git_push.sh
