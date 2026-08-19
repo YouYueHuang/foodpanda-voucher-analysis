@@ -143,9 +143,6 @@ CITY_ID_PATTERNS = [
     r'city_id=(\d+)',
 ]
 
-MAX_VALID_CITY_ID = 1_000_000
-
-
 def fetch_city_id(session, country: dict, slug: str, debug=False):
     url = f"{country['base']}/city/{slug}"
     resp = session.get(url, headers=HTML_HEADERS, timeout=30)
@@ -155,7 +152,7 @@ def fetch_city_id(session, country: dict, slug: str, debug=False):
 
     for pat in CITY_ID_PATTERNS:
         raw_matches = [int(x) for x in re.findall(pat, html)]
-        raw_matches = [x for x in raw_matches if 0 < x < MAX_VALID_CITY_ID]
+        raw_matches = [x for x in raw_matches if x > 0]
         if not raw_matches:
             continue
 
@@ -210,8 +207,10 @@ def crawl_country(country: dict, debug=False):
     for i, (slug, name) in enumerate(cities, 1):
         try:
             city_id = fetch_city_id(session, country, slug, debug=debug)
-            status = city_id if city_id is not None else "❌ 找不到"
-            print(f"  ({i}/{len(cities)}) {name} ({slug}) → {status}")
+            if city_id is None:
+                print(f"  ({i}/{len(cities)}) {name} ({slug}) → ⚠️  無餐廳，略過")
+                continue
+            print(f"  ({i}/{len(cities)}) {name} ({slug}) → {city_id}")
             rows.append({
                 "國家":     country["name"],
                 "城市名":   name,
@@ -220,8 +219,6 @@ def crawl_country(country: dict, debug=False):
             })
         except Exception as e:
             print(f"  ({i}/{len(cities)}) {name} ({slug}) → ❌ 失敗: {e}")
-            rows.append({"國家": country["name"], "城市名": name,
-                        "slug": slug, "city_id": None})
         time.sleep(REQUEST_DELAY)
 
     return rows
@@ -247,14 +244,12 @@ def main():
     for country in targets:
         all_rows.extend(crawl_country(country, debug=args.debug))
 
-    ok = [r for r in all_rows if r["city_id"] is not None]
-
     print("\n" + "=" * 62)
-    print(f"  總結：成功 {len(ok)} / {len(all_rows)} 個城市連結")
+    print(f"  總結：共 {len(all_rows)} 個有效城市（無餐廳城市已略過）")
     print("=" * 62)
     for country in targets:
         cn = country["name"]
-        sub = [r for r in ok if r["國家"] == cn]
+        sub = [r for r in all_rows if r["國家"] == cn]
         print(f"  {cn:<20s}: {len(sub)} 個城市")
 
     # 存 CSV（依需求格式：國家, 城市名, city id）
@@ -263,14 +258,14 @@ def main():
         w = csv.writer(f)
         w.writerow(["國家", "城市名", "city id"])
         for r in all_rows:
-            w.writerow([r["國家"], r["城市名"], r["city_id"] if r["city_id"] is not None else ""])
-    print(f"\n💾 已儲存 {csv_path}（含 {len(all_rows)} 列，city_id 缺漏留空）")
+            w.writerow([r["國家"], r["城市名"], r["city_id"]])
+    print(f"\n💾 已儲存 {csv_path}（含 {len(all_rows)} 列）")
 
     # 額外存完整 JSON（含 slug，方便除錯）
     json_path = f"{args.output}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(all_rows, f, ensure_ascii=False, indent=2)
-    print(f"💾 已儲存 {json_path}（含 slug 欄位供除錯）")
+    print(f"💾 已儲存 {json_path}（含 slug 欄位，無餐廳城市已略過）")
 
 
 if __name__ == "__main__":
