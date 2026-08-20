@@ -4,7 +4,7 @@
 一路到「擷取店家清單」「擷取菜單與優惠券」，最後「產出分析報表」。
 
 涵蓋國家：Bangladesh (bd)、Cambodia (kh)、Laos (la)、Malaysia (my)、Myanmar (mm)、
-Pakistan (pk)、Philippines (ph)。
+Pakistan (pk)、Philippines (ph)、Hong Kong (hk)、Singapore (sg)。
 
 ---
 

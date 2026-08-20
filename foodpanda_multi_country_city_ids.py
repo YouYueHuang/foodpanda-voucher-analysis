@@ -35,6 +35,11 @@ import requests
 # name        : 顯示用中文國名
 # city_page   : 城市列表入口頁（可能帶語言前綴 /zh/city、/en/city）
 # base        : 該國站台網域根，用來組出 /city/{slug} 的完整網址
+#
+# 特殊欄位（香港、新加坡）：
+# mode        : "area" — 該國只有單一城市，直接從 /city/{city_slug}/area 頁抓 area 列表
+# area_page   : area 列表頁完整 URL
+# city_slug   : 城市 slug，用來組出各 area 的完整 URL
 
 COUNTRIES = [
     {"code": "bd", "name": "Bangladesh 孟加拉", "city_page": "https://www.foodpanda.com.bd/city",
@@ -51,6 +56,13 @@ COUNTRIES = [
      "base": "https://www.foodpanda.pk"},
     {"code": "ph", "name": "Philippines 菲律賓", "city_page": "https://www.foodpanda.ph/city",
      "base": "https://www.foodpanda.ph"},
+    # ── Area 模式（單一城市，直接列 area）──────────────────────────────────
+    {"code": "hk", "name": "Hong Kong 香港",    "mode": "area",
+     "area_page": "https://www.foodpanda.hk/zh/city/hong-kong/area",
+     "base": "https://www.foodpanda.hk", "city_slug": "hong-kong"},
+    {"code": "sg", "name": "Singapore 新加坡",  "mode": "area",
+     "area_page": "https://www.foodpanda.sg/city/singapore/area",
+     "base": "https://www.foodpanda.sg", "city_slug": "singapore"},
 ]
 
 REQUEST_DELAY = 0.6
@@ -130,6 +142,34 @@ def fetch_city_links(session, country: dict):
     return cities
 
 
+# ─── Step 1b：Area 模式 — 直接抓 area 列表頁的連結 ─────────────────────────
+# 適用於香港、新加坡這種只有單一城市的國家。
+# 連結格式：/city/{city_slug}/area/{area_slug}（可能帶語言前綴 /zh/、/en/）
+
+def fetch_area_links(session, country: dict):
+    """回傳 [(area_slug, 顯示名稱), ...]，去重保序。"""
+    resp = session.get(country["area_page"], headers=HTML_HEADERS, timeout=30)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    html = resp.text
+
+    city_slug = re.escape(country["city_slug"])
+    pattern = re.compile(
+        r'href="(?:https?://[^"/]+)?(?:/[a-z]{2})?/city/' + city_slug +
+        r'/area/([a-z0-9\-]+)/?"[^>]*>(.*?)</a>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    seen, areas = set(), []
+    for slug, inner in pattern.findall(html):
+        name = re.sub(r"<[^>]+>", "", inner).strip()
+        if not name:
+            continue
+        if slug not in seen:
+            seen.add(slug)
+            areas.append((slug, name))
+    return areas
+
+
 # ─── Step 2：從城市頁解析 city_id ─────────────────────────────────────────────
 # 已用 25 個台灣城市頁 HTML 驗證：city_id 出現在
 #   "city-description-{id}" 與 "city-internal-link-{id}" 這兩個 key 中
@@ -184,11 +224,8 @@ def fetch_city_id(session, country: dict, slug: str, debug=False):
 
 # ─── 主程式 ──────────────────────────────────────────────────────────────────
 
-def crawl_country(country: dict, debug=False):
-    print("\n" + "=" * 62)
-    print(f"  {country['name']}  —  {country['city_page']}")
-    print("=" * 62)
-
+def crawl_country_by_city(country: dict, debug=False):
+    """一般模式：先抓城市列表，再逐一進城市頁取得 city_id。"""
     session = build_session(country)
     rows = []
 
@@ -224,10 +261,53 @@ def crawl_country(country: dict, debug=False):
     return rows
 
 
+def crawl_country_by_area(country: dict, debug=False):
+    """Area 模式（香港、新加坡）：單一城市，直接抓 area 列表頁的 area 名稱與 slug。
+    不需要進每個 area 頁面，因為這類國家沒有城市層級的 city_id 概念，
+    area 本身就是最細單位；「城市名」欄位直接填 area 名稱。
+    """
+    session = build_session(country)
+    rows = []
+
+    try:
+        areas = fetch_area_links(session, country)
+    except Exception as e:
+        print(f"  ❌ 無法抓取 area 列表頁: {e}")
+        return rows
+
+    print(f"  找到 {len(areas)} 個 area 連結")
+    if not areas:
+        print(f"  ⚠️  沒有解析到任何連結，該站台網頁結構可能不同，"
+              f"建議用 --debug 或提供該頁 HTML")
+        return rows
+
+    for i, (slug, name) in enumerate(areas, 1):
+        print(f"  ({i}/{len(areas)}) {name} ({slug})")
+        rows.append({
+            "國家":     country["name"],
+            "城市名":   name,   # area 名稱作為「城市名」欄位
+            "slug":     slug,
+            "city_id":  "",     # area 模式無 city_id 概念，留空
+        })
+
+    return rows
+
+
+def crawl_country(country: dict, debug=False):
+    print("\n" + "=" * 62)
+    label = country.get("area_page", country.get("city_page"))
+    print(f"  {country['name']}  —  {label}")
+    print("=" * 62)
+
+    if country.get("mode") == "area":
+        return crawl_country_by_area(country, debug=debug)
+    return crawl_country_by_city(country, debug=debug)
+
+
 def main():
     p = argparse.ArgumentParser(description="Foodpanda 多國 city_id 爬蟲")
     p.add_argument("--country", default=None,
-                   help="只跑單一國家代碼（如 pk），預設跑全部 7 國")
+                   help="只跑單一國家代碼（如 pk、hk、sg），預設跑全部 9 國")
     p.add_argument("--debug",  action="store_true", help="解析失敗時存 HTML")
     p.add_argument("--output", default="foodpanda_multi_country_city_ids",
                    help="輸出檔名前綴")
